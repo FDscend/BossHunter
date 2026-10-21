@@ -1,8 +1,187 @@
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from bosshunter.ai import credentials
+
+
+class OpenAIRequestRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.logs: list[str] = []
+        self.stop_event = Event()
+        self.config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.invalid/v1",
+                "api_key": "secret-api-key",
+                "model": "test-model",
+                "thinking": "off",
+            },
+            "_workbench_stop_event": self.stop_event,
+            "_workbench_log": self.logs.append,
+        }
+        self.request = credentials.httpx.Request("POST", "https://gateway.invalid/v1/chat/completions")
+        self.success = credentials.httpx.Response(
+            200,
+            request=self.request,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    def test_network_retries_stop_after_three_attempts(self) -> None:
+        with (
+            patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+            patch(
+                "bosshunter.ai.credentials.httpx.post",
+                side_effect=credentials.httpx.ReadTimeout("secret-api-key private-prompt"),
+            ) as post,
+            self.assertRaises(credentials.AIRequestError) as raised,
+        ):
+            credentials.call_openai_compatible_text("private-prompt", self.config, 256, purpose="scoring")
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(retry_wait.call_count, 2)
+        self.assertEqual(raised.exception.kind, "network")
+        self.assertIn("ReadTimeout", str(raised.exception))
+        self.assertIn("attempt=3/3", str(raised.exception))
+        self.assertNotIn("secret-api-key", str(raised.exception))
+        self.assertNotIn("private-prompt", " ".join(self.logs))
+
+    def test_transient_http_errors_retry_and_recover(self) -> None:
+        for status_code in (408, 429, 500, 502, 503, 504):
+            with self.subTest(status_code=status_code):
+                response = credentials.httpx.Response(status_code, request=self.request, json={"error": "busy"})
+                with (
+                    patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+                    patch("bosshunter.ai.credentials.httpx.post", side_effect=[response, self.success]) as post,
+                ):
+                    result = credentials.call_openai_compatible_text("prompt", self.config, 256)
+                self.assertEqual(result, "ok")
+                self.assertEqual(post.call_count, 2)
+                retry_wait.assert_called_once()
+
+    def test_retry_after_seconds_is_not_ignored(self) -> None:
+        response = credentials.httpx.Response(
+            503,
+            request=self.request,
+            headers={"Retry-After": "10"},
+            json={"error": "busy"},
+        )
+        with (
+            patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+            patch("bosshunter.ai.credentials.httpx.post", side_effect=[response, self.success]),
+        ):
+            self.assertEqual(credentials.call_openai_compatible_text("prompt", self.config, 256), "ok")
+        retry_wait.assert_called_once_with(10.0)
+
+    def test_retry_after_http_date_is_not_ignored(self) -> None:
+        retry_date = datetime.now(timezone.utc) + timedelta(seconds=30)
+        response = credentials.httpx.Response(
+            429,
+            request=self.request,
+            headers={"Retry-After": format_datetime(retry_date, usegmt=True)},
+            json={"error": "busy"},
+        )
+        with (
+            patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+            patch("bosshunter.ai.credentials.httpx.post", side_effect=[response, self.success]),
+        ):
+            self.assertEqual(credentials.call_openai_compatible_text("prompt", self.config, 256), "ok")
+        retry_wait.assert_called_once()
+        self.assertGreaterEqual(retry_wait.call_args.args[0], 28.0)
+        self.assertLessEqual(retry_wait.call_args.args[0], 30.0)
+
+    def test_long_retry_after_pauses_without_retrying_early(self) -> None:
+        response = credentials.httpx.Response(
+            429,
+            request=self.request,
+            headers={"Retry-After": "120"},
+            json={"error": "busy"},
+        )
+        with (
+            patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+            patch("bosshunter.ai.credentials.httpx.post", return_value=response) as post,
+            self.assertRaises(credentials.AIRequestError),
+        ):
+            credentials.call_openai_compatible_text("prompt", self.config, 256)
+        post.assert_called_once()
+        retry_wait.assert_not_called()
+
+    def test_auth_quota_and_invalid_requests_are_not_retried(self) -> None:
+        for status_code, message, kind in (
+            (401, "invalid token", "auth"),
+            (403, "forbidden", "auth"),
+            (402, "balance exhausted", "token_quota"),
+            (429, "insufficient_quota", "token_quota"),
+            (400, "bad request", "request_failed"),
+            (404, "model not found", "request_failed"),
+        ):
+            with self.subTest(status_code=status_code, message=message):
+                response = credentials.httpx.Response(
+                    status_code, request=self.request, json={"error": {"message": message}},
+                )
+                with (
+                    patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+                    patch("bosshunter.ai.credentials.httpx.post", return_value=response) as post,
+                    self.assertRaises(credentials.AIRequestError) as raised,
+                ):
+                    credentials.call_openai_compatible_text("prompt", self.config, 256)
+                post.assert_called_once()
+                retry_wait.assert_not_called()
+                self.assertEqual(raised.exception.kind, kind)
+
+    def test_local_protocol_errors_are_not_retried(self) -> None:
+        with (
+            patch.object(self.stop_event, "wait", return_value=False) as retry_wait,
+            patch(
+                "bosshunter.ai.credentials.httpx.post",
+                side_effect=credentials.httpx.LocalProtocolError("invalid local request"),
+            ) as post,
+            self.assertRaises(credentials.AIRequestError),
+        ):
+            credentials.call_openai_compatible_text("prompt", self.config, 256)
+        post.assert_called_once()
+        retry_wait.assert_not_called()
+
+    def test_stopped_task_does_not_start_a_request(self) -> None:
+        self.stop_event.set()
+        with (
+            patch("bosshunter.ai.credentials.httpx.post") as post,
+            self.assertRaises(credentials.OperationCancelled),
+        ):
+            credentials.call_openai_compatible_text("prompt", self.config, 256)
+        post.assert_not_called()
+
+    def test_stop_during_backoff_prevents_another_request(self) -> None:
+        def stop_during_wait(delay: float) -> bool:
+            self.stop_event.set()
+            return True
+
+        with (
+            patch.object(self.stop_event, "wait", side_effect=stop_during_wait),
+            patch(
+                "bosshunter.ai.credentials.httpx.post",
+                side_effect=credentials.httpx.RemoteProtocolError("upstream closed"),
+            ) as post,
+            self.assertRaises(credentials.OperationCancelled),
+        ):
+            credentials.call_openai_compatible_text("prompt", self.config, 256)
+        post.assert_called_once()
+
+    def test_late_response_is_discarded_after_stop(self) -> None:
+        def respond_after_stop(*args: object, **kwargs: object) -> credentials.httpx.Response:
+            self.stop_event.set()
+            return self.success
+
+        with (
+            patch("bosshunter.ai.credentials.httpx.post", side_effect=respond_after_stop) as post,
+            self.assertRaises(credentials.OperationCancelled),
+        ):
+            credentials.call_openai_compatible_text("prompt", self.config, 256)
+        post.assert_called_once()
 
 
 class AnthropicCredentialTests(unittest.TestCase):
@@ -10,6 +189,43 @@ class AnthropicCredentialTests(unittest.TestCase):
         cache = getattr(credentials, "_MODEL_RESOLVE_CACHE", None)
         if cache is not None:
             cache.clear()
+
+    def test_openai_retries_read_error_without_exposing_request_data(self) -> None:
+        logs: list[str] = []
+        stop_event = Event()
+        config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.invalid/v1",
+                "api_key": "secret-api-key",
+                "model": "test-model",
+                "thinking": "off",
+            },
+            "_workbench_stop_event": stop_event,
+            "_workbench_log": logs.append,
+        }
+        response = credentials.httpx.Response(
+            200,
+            request=credentials.httpx.Request("POST", "https://gateway.invalid/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+        with (
+            patch.object(stop_event, "wait", return_value=False) as retry_wait,
+            patch(
+                "bosshunter.ai.credentials.httpx.post",
+                side_effect=[credentials.httpx.ReadError("secret-api-key private-prompt"), response],
+            ) as post,
+        ):
+            result = credentials.call_openai_compatible_text("private-prompt", config, 256)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(post.call_count, 2)
+        retry_wait.assert_called_once()
+        self.assertIn("ReadError", " ".join(logs))
+        self.assertNotIn("secret-api-key", " ".join(logs))
+        self.assertNotIn("private-prompt", " ".join(logs))
+        self.assertNotIn("gateway.invalid", " ".join(logs))
 
     def test_config_api_key_takes_precedence_over_env_vars(self):
         with patch.dict(

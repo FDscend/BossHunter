@@ -1557,7 +1557,14 @@ def api_scoring_preview():
 		max_attempts = config.get("ai", {}).get("scoring_max_attempts", 2)
 		db = _get_web_db()
 		try:
-			return _json_response(preview_scoring(db, **options, max_attempts_per_job=max_attempts))
+			preview = preview_scoring(db, **options, max_attempts_per_job=max_attempts)
+			if config.get("ai", {}).get("provider") == "openai_compatible":
+				from bosshunter.ai.credentials import OPENAI_REQUEST_MAX_ATTEMPTS
+
+				preview["max_attempts_per_job"] *= OPENAI_REQUEST_MAX_ATTEMPTS
+				preview["max_possible_requests"] *= OPENAI_REQUEST_MAX_ATTEMPTS
+				preview["note"] += " 请求预算包含临时网络故障的传输重试。"
+			return _json_response(preview)
 		finally:
 			db.close()
 	except ValueError as exc:

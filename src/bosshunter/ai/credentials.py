@@ -1,16 +1,24 @@
 """Credential helpers for AI providers."""
 
 import hashlib
+import logging
 import os
+import random
 import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from threading import Event
 
 import httpx
 
+from bosshunter.cancellation import OperationCancelled, get_stop_event
 from bosshunter.config import AI_SERVICE_PRESETS
 
 
 _MODEL_RESOLVE_CACHE: dict[tuple[str, str, str], str] = {}
 _THINKING_MODES = {"auto", "disabled", "enabled", "off"}
+OPENAI_REQUEST_MAX_ATTEMPTS = 3
 
 
 def _ambient_proxy_vars() -> bool:
@@ -596,6 +604,93 @@ def call_anthropic_text(
     raise AIRequestError("empty_response", "AI 服务没有返回文本内容，可能只返回了思考过程")
 
 
+def _ai_retry_delay(response: httpx.Response | None, attempt: int) -> float | None:
+    delay = min(2.0 ** attempt, 30.0) + random.uniform(0.0, 1.0)
+    retry_after = str(getattr(response, "headers", {}).get("retry-after", "")).strip()
+    if not retry_after:
+        return delay
+    try:
+        requested_delay = float(retry_after)
+    except ValueError:
+        try:
+            retry_date = parsedate_to_datetime(retry_after)
+            if retry_date.tzinfo is None:
+                retry_date = retry_date.replace(tzinfo=timezone.utc)
+            requested_delay = (retry_date - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return delay
+    if requested_delay > 60.0:
+        return None
+    return max(delay, requested_delay)
+
+
+def _post_openai_completion(
+    payload: dict,
+    config: dict,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    purpose: str | None,
+) -> httpx.Response:
+    stop_event = get_stop_event(config) or Event()
+    log_callback = config.get("_workbench_log")
+
+    def notify(message: str) -> None:
+        if callable(log_callback):
+            log_callback(message)
+        else:
+            logging.getLogger(__name__).info(message)
+
+    for attempt in range(1, OPENAI_REQUEST_MAX_ATTEMPTS + 1):
+        if stop_event.is_set():
+            raise OperationCancelled("用户已请求停止")
+        response = None
+        started = time.monotonic()
+        try:
+            response = httpx.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+                trust_env=False,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            if response is not None and _is_thinking_compatibility_error(exc, response):
+                return response
+            error = normalize_ai_error(exc, response)
+            detail = (
+                f"{type(exc).__name__}, {time.monotonic() - started:.1f}s, "
+                f"attempt={attempt}/{OPENAI_REQUEST_MAX_ATTEMPTS}"
+            )
+            if error.status_code is not None:
+                detail += f", status={error.status_code}"
+            notify(f"AI 请求失败 [{purpose or 'ai'}]：{error} [{detail}]")
+            retryable = isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+            retryable = retryable or error.status_code in {408, 429, 500, 502, 503, 504}
+            if retryable and error.kind not in {"auth", "token_quota"}:
+                error.user_message += f" [{detail}]"
+                error.args = (error.user_message,)
+            if not retryable or error.kind in {"auth", "token_quota"} or attempt == OPENAI_REQUEST_MAX_ATTEMPTS:
+                raise error from exc
+            delay = _ai_retry_delay(response, attempt)
+            if delay is None:
+                notify("AI 服务要求等待超过 60 秒，本轮暂停，不提前重试。")
+                raise error from exc
+            notify(f"AI 请求将在 {delay:.1f} 秒后重试（{attempt + 1}/{OPENAI_REQUEST_MAX_ATTEMPTS}）。")
+            if stop_event.wait(delay):
+                raise OperationCancelled("用户已请求停止") from None
+            continue
+        if stop_event.is_set():
+            raise OperationCancelled("用户已请求停止")
+        notify(
+            f"AI 请求成功 [{purpose or 'ai'}]：{time.monotonic() - started:.1f}s, "
+            f"attempt={attempt}/{OPENAI_REQUEST_MAX_ATTEMPTS}"
+        )
+        return response
+    raise RuntimeError("AI 请求重试流程异常")
+
+
 def call_openai_compatible_text(
     prompt: str,
     config: dict,
@@ -632,14 +727,10 @@ def call_openai_compatible_text(
             **overrides,
         }
         try:
-            response = httpx.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=request_timeout,
-                trust_env=False,
-            )
+            response = _post_openai_completion(payload, config, base_url, api_key, request_timeout, purpose)
             response.raise_for_status()
+        except OperationCancelled:
+            raise
         except Exception as exc:
             if _is_thinking_compatibility_error(exc, response):
                 thinking_rejected = True
